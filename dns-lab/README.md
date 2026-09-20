@@ -19,6 +19,19 @@
 - `fake-baidu.py` —— 仿百度钓鱼页（跑在攻击者 ns-att 上）
 - `webserver.py` —— 通用极简 Web 服务（保留备用）
 
+**局域网配合演示（`lan-dns`，教室桥接推荐）**
+
+- `lab.sh lan-dns-on` / `lan-dns` / `lan-dns-off` —— 本机提供恶意 DNS + 假站，演示机手动改 DNS
+- `redirect-tanei.py` —— 假站/跳转页（由 `lan-dns` / `arp-one` 拉起）
+
+**真实网络 ARP 劫持（`arp-one` 模式，需授权；勿用于校园大网）**
+
+- `lab.sh arp-one <目标IP>` —— 对单台设备做完整中间人（ARP 欺骗 + DNS 劫持）
+- `arp-fix-gw.py` —— 纠正**网关**的邻居表（收尾必做，见「真实网络 ARP 劫持的收尾」）
+- `arp-fix.py` —— 尝试纠正目标机的 ARP 缓存（Windows 通常忽略，效果有限）
+- `arp-fix-req.py` —— 以 ARP 请求形式修正（实测仍常被 Windows 忽略，作备选）
+- `arp-watch.py` —— 观测目标机流量指向哪个 MAC，用来判断它是否真的脱离了本机
+
 **Windows 版（没有 netns 可用，只能在「本地安全」与「局域网需授权」之间取舍）**
 
 - `dns-hijack-win.py` —— Windows 下的 DNS 劫持脚本（`local` / `lan` 两种模式）
@@ -149,6 +162,49 @@ sudo ./lab.sh down
 
 那就跳过 `nat-on`，`up` + `attack` 后用命令行 `dig` / `curl` 演示。
 效果差一点，但零副作用。
+
+## 局域网演示：教室电脑手动指向本机
+
+**适用场景**：Kali 已经桥接进教室局域网（拿到的是校园网/教室网的真实 IP，
+不再是 VMware NAT 网段）。这时可以给**主动配合的演示机**提供 DNS 服务。
+
+```bash
+sudo ./lab.sh lan-dns-on     # 开启：把 www.baidu.com 劫持到本机，同时起假站
+sudo ./lab.sh lan-dns        # 查看状态（会打印演示机的配置命令）
+sudo ./lab.sh lan-dns-off    # 停止
+```
+
+演示机（Windows）上：
+
+```powershell
+# 把 DNS 改成 Kali 的 IP（lan-dns 会把实际地址打印出来）
+netsh interface ip set dns "以太网" static <Kali的IP>
+ipconfig /flushdns
+
+# 浏览器访问 http://www.baidu.com/  → 钓鱼页
+
+# 演示完恢复
+netsh interface ip set dns "以太网" dhcp
+ipconfig /flushdns
+```
+
+**只劫持 `www.baidu.com`，其他域名转发上游 DNS**（默认 `202.116.32.254`，
+可用环境变量 `LAN_UPSTREAM` 改），所以演示机改完 DNS 后其他网站照常访问。
+
+### 为什么不用 ARP 欺骗？
+
+桥接之后 Kali 确实和教室电脑在同一广播域，ARP 欺骗技术上可行 ——
+但**强烈不建议**，理由很具体：
+
+- **广播域可能极大**。校园网常见 `/17` 这种大网段（地址空间三万多），
+  同一个 VLAN 里可能有上千台设备（同学的电脑、老师机、打印机、AP……）
+- **影响不可控**。ARP 欺骗在广播域内生效，配置稍有差池（比如包发成广播
+  形式）就波及无关设备
+- **校园网有 ARP 防护**。触发检测后，网络中心可能直接封禁你的端口/MAC
+- **这是生产网络**。在上面做攻击性实验需要书面授权，多数学校规定也禁止
+
+`lan-dns` 模式只影响**主动把自己 DNS 改成 Kali 的那台电脑**，其他设备
+毫无感知。演示效果一样，风险低得多。
 
 ## 课堂上怎么讲（逐步 + 讲解词）
 
@@ -405,6 +461,98 @@ sudo sh -c 'echo "nameserver 10.66.0.10" > /etc/resolv.conf'
 
 ---
 
+## 真实网络 ARP 劫持的收尾（重要）
+
+> 前提：`arp-one` 只在**你自己的**可控小网络（比如手机热点下的两三台设备）
+> 里用。广播域大的环境（校园网、公司网）见上一节「为什么不用 ARP 欺骗？」。
+
+`arp-one` 是完整中间人 —— 目标机的**全部**流量都经过本机，演示效果最直观，
+但**收尾比启动麻烦得多**。netns 靶场里 `attack-stop` 一敲就干净，真实网络
+不是这样。下面这套是实测踩出来的。
+
+### 现象
+
+`arp-one-off` 之后：攻击进程确实全退了、iptables 也干净，**但目标机的流量
+仍然全部送到本机**，本机一关转发它就断网。
+
+### 三个坑
+
+**坑 1：Windows 会忽略「未经请求」的 ARP 修正**
+
+`arp-fix.py` 只发 ARP **应答**。Windows 对处于 Reachable 状态的邻居条目，
+会直接丢弃这种未经请求的应答 —— 发多少次都没用。改成 ARP **请求**
+（源地址写成网关）同样无效：实测目标机收到后确实回了一个应答，但**仍然
+没有更新网关条目**。
+
+**坑 2：网关的邻居表也被污染了（最隐蔽）**
+
+本机转发目标机的上行包时，**以太网源 MAC 是本机自己的，IP 源仍是目标机**。
+网关收到后会把「目标机 IP → 本机 MAC」记进自己的邻居表，于是回包全部发到
+本机；本机再把回包转发给目标机，目标机看到「IP 是网关、MAC 却是本机」，
+又学到「网关 = 本机 MAC」。
+
+**两边互相教坏，形成自维持的死循环。** 只清目标机的缓存没用 —— 只要本机
+还开着转发，一分钟内就被污染回去。
+
+**坑 3：RFC 4861 的「上层可达性确认」**
+
+RFC 4861 §7.3.1：如果上层协议能提供可达性确认（例如 TCP 收到了 ACK），
+节点可以把邻居条目直接保持在 Reachable，而**不做** NUD 重解析。
+
+因为本机在转发，目标机的 TCP 一直收得到 ACK，于是它**永远**认为网关条目
+有效，永远不会主动去重新问网关的 MAC。
+
+### 正确的收尾
+
+顺序不能换。`lab.sh` 的 `arp-one-off` 已按此实现：
+
+```bash
+sudo ./lab.sh arp-one-off
+```
+
+手动等价于：
+
+```bash
+# 1a. 停服务后「先关转发」——只要还在转发，网关邻居表就会被反复污染
+sudo sysctl -w net.ipv4.ip_forward=0
+# 1b. 纠正「网关」的邻居表（最容易漏，也最关键的一步）
+sudo python3 arp-fix-gw.py eth0 <目标机IP> <目标机MAC> <网关IP> <网关MAC>
+# 1c. 再尽力纠正目标机（大概率无效，见坑 1）
+sudo python3 arp-fix.py eth0 <目标机IP> <目标机MAC> <网关IP> <网关MAC>
+```
+
+```text
+# 2. 在目标机上彻底重置网络（二选一）
+#    推荐：断开 Wi-Fi 再重连 —— 同时清缓存 + 重新 DHCP + 重新解析
+#    或者（管理员 CMD）：arp -d *
+```
+
+```bash
+# 3. 回本机验证：30 秒内应抓不到目标机的任何帧
+sudo timeout 30 tcpdump -i eth0 -n -e 'ether host <目标机MAC>'
+# 0 packets captured  →  彻底脱离
+```
+
+### 验证时别用错过滤器
+
+**不要用 `src host <目标机IP>`。** 本机转发时以太网源 MAC 变了、但 IP 源
+还是目标机，所以转发副本也会被算进去，看上去「两边都有流量」，极易误判成
+已修复（这一幕我们自己就误判过两次）。
+
+要看目标机**自己**发出的帧，就用**以太网源**过滤：
+
+```bash
+sudo tcpdump -i eth0 -n -e 'ether src <目标机MAC>'
+# 看目的 MAC 是不是网关的 —— 是，才算真的修好
+```
+
+### 如果嫌收尾麻烦
+
+只想演示 DNS 劫持、不想碰这些残留的话，用 `lan-dns` 模式（让演示机手动把
+DNS 指向本机）更省事：启停都只是几个后台服务，不碰系统设置，也不留 ARP 残留。
+
+---
+
 ## 防御视角（课程讨论点）
 
 按攻击链条逐环拆：
@@ -433,42 +581,35 @@ HTTPS 让纯 DNS 劫持杀伤力下降，但钓鱼依然有效。
 
 ---
 
-## 常见问题与实操提示
+## 常见问题
 
-**解压后找不到 `lab.sh`？**  
-目录应是一层 `dns-lab/lab.sh`。若变成 `dns-lab/dns-lab/lab.sh`，是套娃解压——进入内层或重新解压到空目录。
-
-**`REAL_IP` 要更新吗？**  
+**`REAL_IP` 要更新吗？**
 百度有 CDN，不同地区/时间解析结果会变。演示前跑一下
-`dig +short www.baidu.com`，把 **A 记录**更新到 `lab.sh` 顶部的 `REAL_IP`。
+`dig +short www.baidu.com`，把结果更新到 `lab.sh` 顶部的 `REAL_IP`。
 
-**`attack` 后 dig 还返回真实 IP？**  
+**`attack` 后 dig 还返回真实 IP？**
 ARP 欺骗还没生效。脚本内置等待和检测，会打印「ARP 欺骗已生效」。
 一直不生效就先 `attack-stop` 再重新 `attack`。
 
-**`nat-on` 之后忘了收尾？**  
-务必 `browser-kill` → `nat-off` → `down`。否则宿主机可能残留转发与网桥地址。
+**会不会影响真实网络？**
+不会。靶场在独立 netns，网桥不配 IP，`ip_forward` 保持 0。`down` 之后
+全部回收。自查：`ip netns list; ip -br link show type bridge; ip -br addr`。
 
-**会不会影响真实网络？**  
-默认不会。靶场在独立 netns；未开 `nat-on` 时网桥不配对外路由。`down` 之后应全部回收。自查：`ip netns list; ip -br link show type bridge; ip -br addr`。
-
-**浏览器仍打开真百度？**  
-地址栏请用 `http://www.baidu.com`（不要依赖 HTTPS）；再执行一次 `sudo ./lab.sh browser` 清掉缓存连接。
-
-**能用别的域名演示吗？**  
+**能用别的域名演示吗？**
 能。改 `lab.sh` 顶部的 `DOMAIN` / `HOST` / `REAL_IP` 三个变量，把
 `fake-baidu.py` 换成对应仿站即可。
-
-**源码放在 sshfs / Windows 共享盘上 QEMU 或网卡异常？**  
-把工作副本放到 Linux 本地磁盘再跑（网络盘对部分底层打开方式不友好）。
 
 ---
 
 ## 清理
 
 ```bash
-sudo ./lab.sh down
+sudo ./lab.sh down          # 清理 netns 靶场
+sudo ./lab.sh lan-dns-off   # 停止局域网 DNS 劫持（如果开过）
 ```
 
-停服务、删 netns（连带 veth）、删网桥、移除 `/etc/netns/ns-vic`。
-演示结束以「无残留 netns / 无 br-dnslab」为准。
+`down` 会停服务、删 netns（连带回收 veth）、删除网桥、移除
+`/etc/netns/ns-vic`。
+
+`lan-dns-off` 只是停掉两个后台服务（dnsmasq 和假站），**不改动任何
+系统配置** —— 因为 `lan-dns` 模式本来就不碰系统设置。

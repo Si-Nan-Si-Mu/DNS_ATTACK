@@ -28,10 +28,15 @@ DNS_ATTACK/
 
 | 文件 | 说明 |
 |------|------|
-| `lab.sh` | Linux 靶场主控（搭建 / 攻击 / 恢复 / 清理） |
+| `lab.sh` | Linux 靶场主控（netns / `lan-dns` / `arp-one` 等） |
 | `dns-spoof.py` | DNS 抢答器（scapy） |
 | `fake-baidu.py` | 仿百度钓鱼页（HTTP + HTTPS 自签） |
 | `webserver.py` | 通用极简 Web 服务（备用） |
+| `redirect-tanei.py` | 302 跳转服务（`lan-dns` / `arp-one` 假站用） |
+| `arp-fix-gw.py` | 收尾用：纠正**网关**的邻居表（ARP 劫持后必做） |
+| `arp-fix.py` | 收尾用：尝试纠正目标机 ARP 缓存（Windows 通常忽略） |
+| `arp-fix-req.py` | 收尾用：以 ARP 请求形式修正（效果仍有限，作备选） |
+| `arp-watch.py` | 收尾用：观测目标机流量指向哪个 MAC，判断是否真的脱离 |
 | `dns-hijack-win.py` | Windows 版（`local` / `lan`） |
 | `WINDOWS-使用说明.md` | Windows 用法、Npcap、端口冲突 |
 | `README.md` | Linux 逐步讲解与防御视角 |
@@ -131,7 +136,34 @@ netsh interface ip set dns "以太网" dhcp
 ipconfig /flushdns
 ```
 
-**不要**在未授权的校园网/公司网跑 `lan` 模式。
+**不要**在未授权的校园网/公司网跑 Windows `lan`（ARP）模式。
+
+---
+
+## 教室桥接演示（推荐：`lan-dns`，不碰 ARP）
+
+Kali 已桥接到教室局域网、拿到真实 IP 时，让**主动配合的演示机**把 DNS 指到本机即可：
+
+```bash
+sudo ./lab.sh lan-dns-on     # 劫持 www.baidu.com → 本机 + 起假站
+sudo ./lab.sh lan-dns        # 打印演示机应执行的配置命令
+sudo ./lab.sh lan-dns-off    # 停止（不改系统配置，只停后台服务）
+```
+
+演示机（Windows）按 `lan-dns` 输出把 DNS 设为 Kali IP，访问 `http://www.baidu.com/`，结束后改回 DHCP。  
+只劫持百度域名，其他域名转发上游 DNS，互不影响。
+
+> **不要在校园大网做 ARP 欺骗。** 广播域可能极大，易误伤、易触发防护封禁。详见包内 README「为什么不推荐 ARP 欺骗」。
+
+### 仅自有小网络：`arp-one`（完整中间人，需授权）
+
+```bash
+sudo ./lab.sh arp-one <目标IP>    # 启动（手机热点等可控小网）
+sudo ./lab.sh arp-one-off         # 停止：先关转发 + 纠正网关邻居表
+# 目标机仍建议：断开 Wi-Fi 再重连，或管理员 arp -d *
+```
+
+收尾细节见包内 `dns-lab/README.md`「真实网络 ARP 劫持的收尾」。嫌麻烦就改用 `lan-dns`。
 
 ---
 
@@ -176,6 +208,13 @@ ipconfig /flushdns
 8. **Linux 工作目录放本地盘**  
    源码若在 sshfs/网络盘上，部分虚拟网卡/镜像操作可能失败；请放到本机磁盘。
 
+9. **`arp-one` 的收尾比启动麻烦得多**  
+   对真实设备做 ARP 劫持后，目标机不会自动恢复：Windows 会忽略未经请求的
+   ARP 更新，而且**网关的邻居表也会被污染**（本机转发时以太网源是自己的
+   MAC），两边互相教坏形成死循环。正确收尾是「先关转发 → 纠正网关邻居表
+   → 目标机断开 Wi-Fi 重连」。详见包内 `dns-lab/README.md` 的
+   「真实网络 ARP 劫持的收尾」。
+
 ---
 
 ## 验证说明（资料维护）
@@ -193,11 +232,13 @@ ipconfig /flushdns
 
 ## 安全边界（重要）
 
-- **Linux**：流量封在 `10.66.0.0/24` netns 内；`down` 后应零残留。  
+- **Linux netns**：流量封在 `10.66.0.0/24`；`down` 后应零残留。  
+- **`lan-dns`**：只影响主动改 DNS 的演示机；适合教室桥接演示。  
+- **`arp-one`**：完整中间人，仅限自有可控小网；校园大网禁止。收尾必须到位。  
 - **Windows `local`**：只影响本机；改完 DNS 务必改回 DHCP。  
-- **Windows `lan`**：对真实二层网络的攻击，仅限自有/已授权环境。
+- **Windows `lan`（ARP）**：对真实二层网络的攻击，仅限自有/已授权环境。
 
-建议：学生各自跑 Linux 靶场或 Windows `local`；教师投屏演示即可。
+建议：学生跑 netns 靶场或 Windows `local`；教师教室演示优先 `lan-dns`。
 
 ---
 
